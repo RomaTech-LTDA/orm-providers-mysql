@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/romatech-ltda/orm-providers-mysql"
+    "url": "https://github.com/RomaTech-LTDA/orm-providers-mysql"
   },
-  "homepage": "https://github.com/romatech-ltda/orm-providers-mysql#readme",
+  "homepage": "https://github.com/RomaTech-LTDA/orm-providers-mysql#readme",
   "bugs": {
-    "url": "https://github.com/romatech-ltda/orm-providers-mysql/issues"
+    "url": "https://github.com/RomaTech-LTDA/orm-providers-mysql/issues"
   },
   "keywords": [
     "orm",
