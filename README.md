@@ -1,5 +1,8 @@
 # @romatech/orm-providers-mysql
 
+[![npm](https://img.shields.io/npm/v/@romatech%2Form-providers-mysql)](https://www.npmjs.com/package/@romatech/orm-providers-mysql)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/RomaTech-LTDA/orm-providers-mysql/blob/main/LICENSE)
+
 <p align="center">
   <img src="logo.png" width="120" alt="RomaTech ORM – MySQL Provider" />
 </p>
