@@ -88,6 +88,32 @@ new MySqlProvider('mysql://root:password@localhost:3306/mydb')
 - Schema management (createTable, dropTable, addColumn, removeColumn)
 - Scaffold (introspect via `INFORMATION_SCHEMA.COLUMNS` and `SHOW TABLES`)
 - Parameterised queries (SQL injection safe)
+- Transactions through `DbContext.beginTransaction()` (since 2.1.0; in 2.0.0 the
+  `BEGIN` statement failed with `ER_UNSUPPORTED_PS`)
+
+### Notes
+
+- The provider uses **one connection**: a transaction covers every statement
+  sent through the provider meanwhile, so use one `DbContext` per unit of work
+  when requests run concurrently.
+- `update`, `remove` and `find` locate the row by the table's single-column
+  primary key (or `id` when the table has none). Tables with a **composite**
+  primary key are rejected with an error, instead of matching every row that
+  shares the first key column.
+- The primary key of each table is introspected once and cached. The cache is
+  cleared after the provider's own DDL and after raw statements that are not
+  `SELECT`/`WITH`/`SHOW`/`DESCRIBE`/`EXPLAIN`; call
+  `provider.clearMetadataCache()` if another process changes the schema while
+  the provider is connected.
+- Query predicates are evaluated by MySQL and then re-checked in JavaScript on
+  converted copies of the rows: `BOOLEAN`/`TINYINT(1)` and `BIT(1)` are
+  compared as booleans (so `x => x.active === true` works), `DECIMAL` and
+  `BIGINT` strings as numbers, and date strings (`dateStrings` option) as
+  `Date`. The rows you get back are the driver's rows, unchanged. A
+  comparison of a date column with a string literal
+  (`x => x.createdAt >= '2024-01-01'`) is left to MySQL. A `TINYINT(1)` used
+  for small integers is therefore compared as a boolean in predicates; use
+  `TINYINT` (or a wider type) for numbers.
 
 ---
 

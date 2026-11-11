@@ -14,7 +14,6 @@
 
 import mysql from 'mysql2/promise';
 import {
-  applyClientSideQuery,
   buildDeleteSql,
   buildFindSql,
   buildInsertSql,
@@ -26,6 +25,10 @@ import {
   SqlDialect,
   TableColumnInfo
 } from '@romatech/orm';
+import { applyQueryToDriverRows, DriverColumns, toBoolean, toDate, toNumber, ValueConverter } from './driver-rows';
+
+/** Raw statements that cannot change the schema (they keep the key cache). */
+const READ_ONLY_STATEMENT = /^\s*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i;
 
 /**
  * Configuration object for a MySQL / MariaDB connection.
@@ -116,6 +119,9 @@ export class MySqlProvider implements IDbProvider {
   /** The `mysql2` connection used for all database operations. */
   private connection!: any;
 
+  /** Primary-key columns per table, so DML does not introspect on every call. */
+  private readonly primaryKeyCache = new Map<string, Promise<string[]>>();
+
   /**
    * Creates a new `MySqlProvider` instance.
    *
@@ -180,7 +186,7 @@ export class MySqlProvider implements IDbProvider {
    */
   async add<T extends object>(entity: T, tableName: string): Promise<void> {
     const command = buildInsertSql(tableName, entity, dialect);
-    await this.executeNonQuery(command.sql, command.params);
+    await this.run(command.sql, command.params);
   }
 
   /**
@@ -223,12 +229,13 @@ export class MySqlProvider implements IDbProvider {
    */
   async update<T extends object>(entity: T, tableName: string): Promise<void> {
     const primaryKey = await this.getPrimaryKeyColumn(tableName);
-    // Guard: skip the round-trip if there are no columns to update besides the PK.
-    if (!Object.keys(entity).some(key => key !== primaryKey)) {
+    // Guard: skip the round-trip if there are no columns to update besides the PK
+    // (undefined values are not written, so they do not count).
+    if (!Object.entries(entity).some(([key, value]) => key !== primaryKey && value !== undefined)) {
       return;
     }
     const command = buildUpdateSql(tableName, entity, primaryKey, dialect);
-    await this.executeNonQuery(command.sql, command.params);
+    await this.run(command.sql, command.params);
   }
 
   /**
@@ -247,7 +254,7 @@ export class MySqlProvider implements IDbProvider {
    */
   async remove<T extends object>(entity: T, tableName: string): Promise<void> {
     const command = buildDeleteSql(tableName, entity, await this.getPrimaryKeyColumn(tableName), dialect);
-    await this.executeNonQuery(command.sql, command.params);
+    await this.run(command.sql, command.params);
   }
 
   /**
@@ -336,7 +343,7 @@ export class MySqlProvider implements IDbProvider {
    */
   async addMigration(migrationName: string, migrationScript: string): Promise<void> {
     await this.ensureMigrationHistoryTable();
-    await this.executeNonQuery(
+    await this.run(
       'INSERT INTO `__roma_migrations` (`migrationName`, `migrationScript`) VALUES (?, ?)',
       [migrationName, migrationScript]
     );
@@ -356,7 +363,7 @@ export class MySqlProvider implements IDbProvider {
    */
   async removeMigration(migrationName: string): Promise<void> {
     await this.ensureMigrationHistoryTable();
-    await this.executeNonQuery('DELETE FROM `__roma_migrations` WHERE `migrationName` = ?', [migrationName]);
+    await this.run('DELETE FROM `__roma_migrations` WHERE `migrationName` = ?', [migrationName]);
   }
 
   /**
@@ -448,7 +455,8 @@ export class MySqlProvider implements IDbProvider {
       .map(column => `${dialect.quoteIdentifier(column.name)} ${this.mapColumnType(column)}${column.primaryKey ? ' NOT NULL' : ''}`)
       .join(', ');
     const primaryKeySql = primaryKey ? `, PRIMARY KEY (${dialect.quoteIdentifier(primaryKey)})` : '';
-    await this.executeNonQuery(`CREATE TABLE IF NOT EXISTS ${dialect.quoteIdentifier(input.tableName)} (${columns}${primaryKeySql})`);
+    await this.run(`CREATE TABLE IF NOT EXISTS ${dialect.quoteIdentifier(input.tableName)} (${columns}${primaryKeySql})`, []);
+    this.clearMetadataCache(input.tableName);
   }
 
   /**
@@ -465,7 +473,8 @@ export class MySqlProvider implements IDbProvider {
    * await provider.dropTable('products');
    */
   async dropTable(tableName: string): Promise<void> {
-    await this.executeNonQuery(`DROP TABLE IF EXISTS ${dialect.quoteIdentifier(tableName)}`);
+    await this.run(`DROP TABLE IF EXISTS ${dialect.quoteIdentifier(tableName)}`, []);
+    this.clearMetadataCache(tableName);
   }
 
   /**
@@ -482,9 +491,11 @@ export class MySqlProvider implements IDbProvider {
    * await provider.addColumn('products', { name: 'sku', tsType: 'string' });
    */
   async addColumn(tableName: string, column: TableColumnInfo): Promise<void> {
-    await this.executeNonQuery(
-      `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD COLUMN ${dialect.quoteIdentifier(column.name)} ${this.mapColumnType(column)}`
+    await this.run(
+      `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD COLUMN ${dialect.quoteIdentifier(column.name)} ${this.mapColumnType(column)}`,
+      []
     );
+    this.clearMetadataCache(tableName);
   }
 
   /**
@@ -501,9 +512,11 @@ export class MySqlProvider implements IDbProvider {
    * await provider.removeColumn('products', 'sku');
    */
   async removeColumn(tableName: string, columnName: string): Promise<void> {
-    await this.executeNonQuery(
-      `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(columnName)}`
+    await this.run(
+      `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(columnName)}`,
+      []
     );
+    this.clearMetadataCache(tableName);
   }
 
   /**
@@ -538,9 +551,9 @@ export class MySqlProvider implements IDbProvider {
    * Returns column metadata for a given table, including primary-key detection.
    *
    * Queries `INFORMATION_SCHEMA.COLUMNS` and uses the `COLUMN_KEY = 'PRI'`
-   * flag to identify the primary-key column.  When the config supplies a
-   * `database` (schema) name it is added as an extra `TABLE_SCHEMA` filter to
-   * avoid ambiguity across schemas.
+   * flag to identify the primary-key column.  Only the database of the current
+   * connection (`DATABASE()`) is inspected, so a table with the same name in
+   * another database cannot leak its columns or primary key into the result.
    *
    * @param table - Name of the table to inspect.
    * @returns An array of {@link TableColumnInfo} objects.
@@ -551,16 +564,16 @@ export class MySqlProvider implements IDbProvider {
    * // [{ name: 'id', tsType: 'number', primaryKey: true }, ...]
    */
   async getColumnsForTable(table: string): Promise<TableColumnInfo[]> {
-    // When config is an object we have the schema name and can add an extra
-    // WHERE clause to prevent cross-schema collisions.
-    const database = typeof this.config === 'string' ? undefined : this.config.database;
+    // DATABASE() is the schema the connection actually uses, whatever form
+    // the configuration took (object, URI or a connect() override).
     const rows = await this.executeQuery<{ name: string; type: string; columnKey: string }>(
       `
       SELECT COLUMN_NAME as name, DATA_TYPE as type, COLUMN_KEY as columnKey
       FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_NAME = ? ${database ? 'AND TABLE_SCHEMA = ?' : ''}
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+      ORDER BY ORDINAL_POSITION
       `,
-      database ? [table, database] : [table]
+      [table]
     );
 
     return rows.map(column => ({
@@ -588,8 +601,16 @@ export class MySqlProvider implements IDbProvider {
    * const rows = await provider.executeQuery('products', query);
    * ```
    * When a `QueryObject` is supplied the provider pushes serializable `WHERE`
-   * and `ORDER BY` clauses to MySQL, then applies any remaining client-side
-   * predicates via {@link applyClientSideQuery}.
+   * and `ORDER BY` clauses to MySQL, then re-applies the JS predicates,
+   * ordering, paging and projection on copies of the rows whose driver values
+   * are converted to the JS types the entity uses (`BOOLEAN`/`TINYINT(1)` and
+   * `BIT(1)` to booleans, `DECIMAL` and `BIGINT` strings to numbers, date
+   * strings to `Date`), so `where(x => x.active === true)` keeps the rows
+   * MySQL matched. The original rows are returned. A predicate MySQL already
+   * applied that compares a date column with a string literal is not re-run.
+   *
+   * Raw statements other than `SELECT`/`WITH`/`SHOW`/`DESCRIBE`/`EXPLAIN`
+   * clear the primary-key cache (see {@link clearMetadataCache}).
    *
    * @param query - Either a raw SQL string or a table name (for QueryObject).
    * @param params - Parameter array for raw SQL, or a `QueryObject`.
@@ -606,20 +627,25 @@ export class MySqlProvider implements IDbProvider {
       // QueryObject path: build server-side SQL, then apply remaining
       // client-side predicates (e.g. JS closures that can't be serialized).
       const command = buildSelectSql(queryOrEntityName, paramsOrQuery, dialect);
-      const rows = await this.executeQuery<T>(command.sql, command.params);
-      return applyClientSideQuery(rows, paramsOrQuery);
+      const [rows, fields] = await this.run(command.sql, command.params);
+      return applyQueryToDriverRows(rows as T[], paramsOrQuery, driverColumns(fields));
     }
 
-    // mysql2's execute() returns [rows, fields]; we only need the rows array.
-    const [rows] = await this.connection.execute(queryOrEntityName, paramsOrQuery);
+    if (!READ_ONLY_STATEMENT.test(queryOrEntityName)) {
+      // The statement may change the schema (keys included), or roll back DDL.
+      this.clearMetadataCache();
+    }
+
+    // mysql2 returns [rows, fields]; we only need the rows array.
+    const [rows] = await this.run(queryOrEntityName, paramsOrQuery);
     return rows as T[];
   }
 
   /**
    * Executes a non-query SQL statement (INSERT / UPDATE / DELETE / DDL).
    *
-   * Uses `execute()` from `mysql2/promise` which supports prepared statements
-   * and positional `?` parameters.
+   * Statements with parameters run as prepared statements (`execute()`) with
+   * positional `?` placeholders; see {@link run}.
    *
    * @param sql - Parameterized SQL statement with `?` placeholders.
    * @param params - Positional parameter values.
@@ -633,7 +659,39 @@ export class MySqlProvider implements IDbProvider {
    * );
    */
   async executeNonQuery(sql: string, params: any[] = []): Promise<void> {
-    await this.connection.execute(sql, params);
+    if (!READ_ONLY_STATEMENT.test(sql)) {
+      // The statement may change the schema (keys included).
+      this.clearMetadataCache();
+    }
+    await this.run(sql, params);
+  }
+
+  /**
+   * Forgets the cached primary-key metadata (of one table, or of all).
+   * The provider already does this after its own DDL and after raw
+   * statements that are not `SELECT`/`SHOW`; call it when the schema is
+   * changed by another process while this provider is connected.
+   */
+  clearMetadataCache(tableName?: string): void {
+    if (tableName === undefined) {
+      this.primaryKeyCache.clear();
+    } else {
+      this.primaryKeyCache.delete(tableName);
+    }
+  }
+
+  /**
+   * Sends a statement to MySQL. Parameterized statements use the prepared
+   * statement protocol (`execute()`); statements without parameters use the
+   * text protocol (`query()`), because MySQL rejects statements such as
+   * `BEGIN`, `START TRANSACTION` or `ROLLBACK` in the prepared protocol
+   * (ER_UNSUPPORTED_PS), which broke `DbContext.beginTransaction()`. Nothing
+   * is interpolated in either case.
+   */
+  private run(sql: string, params: any[]): Promise<[any, any]> {
+    return params.length > 0
+      ? this.connection.execute(sql, params)
+      : this.connection.query(sql);
   }
 
   /**
@@ -644,27 +702,48 @@ export class MySqlProvider implements IDbProvider {
    * `appliedAt` timestamp defaulting to `CURRENT_TIMESTAMP`.
    */
   private async ensureMigrationHistoryTable(): Promise<void> {
-    await this.executeNonQuery(`
+    await this.run(`
       CREATE TABLE IF NOT EXISTS \`__roma_migrations\` (
         \`migrationName\` VARCHAR(255) NOT NULL PRIMARY KEY,
         \`migrationScript\` LONGTEXT NOT NULL,
         \`appliedAt\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `, []);
   }
 
   /**
    * Resolves the primary-key column name for a given table.
    *
-   * Falls back to `'id'` when no primary key is detected (e.g. composite keys
-   * or views).
+   * Falls back to `'id'` when no primary key is detected (e.g. views).
+   * Composite keys are rejected: matching rows by only one of their key
+   * columns would update or delete every row sharing that value.
+   *
+   * The key columns are cached per table (see {@link clearMetadataCache}),
+   * so `update`/`remove`/`find` cost one round trip instead of two.
    *
    * @param tableName - Table to inspect.
    * @returns The primary-key column name or `'id'`.
+   * @throws {Error} If the table has a composite primary key.
    */
   private async getPrimaryKeyColumn(tableName: string): Promise<string> {
-    const primaryKey = (await this.getColumnsForTable(tableName)).find(column => column.primaryKey)?.name;
-    return primaryKey || 'id';
+    let cached = this.primaryKeyCache.get(tableName);
+    if (!cached) {
+      const lookup = this.getColumnsForTable(tableName)
+        .then(columns => columns.filter(column => column.primaryKey).map(column => column.name));
+      cached = lookup;
+      this.primaryKeyCache.set(tableName, lookup);
+      // A failed lookup is not cached.
+      lookup.catch(() => {
+        if (this.primaryKeyCache.get(tableName) === lookup) {
+          this.primaryKeyCache.delete(tableName);
+        }
+      });
+    }
+    const keys = await cached;
+    if (keys.length > 1) {
+      throw new Error(`Table '${tableName}' has a composite primary key (${keys.join(', ')}); update/remove/find by entity support a single-column key only.`);
+    }
+    return keys[0] || 'id';
   }
 
   /**
@@ -716,4 +795,29 @@ export class MySqlProvider implements IDbProvider {
     if (/(json)/.test(normalized)) return 'unknown';
     return 'string';
   }
+}
+
+/** mysql2 column type codes (`FieldPacket.columnType`). */
+const MYSQL_TYPE = { DECIMAL: 0, TINY: 1, TIMESTAMP: 7, LONGLONG: 8, DATE: 10, DATETIME: 12, NEWDATE: 14, BIT: 16, NEWDECIMAL: 246 };
+
+/**
+ * Converters for the columns of a mysql2 result set: `BOOLEAN`/`TINYINT(1)`
+ * and `BIT(1)` to booleans, `DECIMAL` (a string by default) and `BIGINT`
+ * strings to numbers, date strings (`dateStrings` option) to `Date`.
+ */
+function driverColumns(fields: any[] | undefined): DriverColumns {
+  const converters: Record<string, ValueConverter> = {};
+  const temporal = new Set<string>();
+  for (const field of fields || []) {
+    const type = field?.columnType ?? field?.type;
+    if ((type === MYSQL_TYPE.TINY || type === MYSQL_TYPE.BIT) && field.columnLength === 1) {
+      converters[field.name] = toBoolean;
+    } else if (type === MYSQL_TYPE.DECIMAL || type === MYSQL_TYPE.NEWDECIMAL || type === MYSQL_TYPE.LONGLONG) {
+      converters[field.name] = toNumber;
+    } else if ([MYSQL_TYPE.DATE, MYSQL_TYPE.NEWDATE, MYSQL_TYPE.DATETIME, MYSQL_TYPE.TIMESTAMP].includes(type)) {
+      converters[field.name] = toDate;
+      temporal.add(field.name);
+    }
+  }
+  return { converters, temporal };
 }
