@@ -127,6 +127,17 @@ describe('client-side predicates on driver values', () => {
     assert.deepEqual((await query(provider).where(x => x.small === 1).toList()).map(r => r.id), [1]);
   });
 
+  test('predicates written against the driver values (2.0.0 style) still match the rows MySQL returned', async () => {
+    // MySQL applied `active = 1` / `small = 1` / `price = '12.50'`; the re-check must not drop the rows.
+    const { provider } = stubProvider(singleKey, { rows: [rows[0]], fields });
+    assert.deepEqual((await query(provider).where(x => x.active === 1).toList()).map(r => r.id), [1]);
+    assert.deepEqual((await query(provider).where(x => x.price === '12.50').toList()).map(r => r.id), [1]);
+    // When JavaScript is the only filter (untranslatable predicate), the converted value decides.
+    const { provider: all } = stubProvider(singleKey, { rows, fields });
+    const ids = [1, 2];
+    assert.deepEqual((await query(all).where(x => ids.includes(x.id) && x.active !== true).toList()).map(r => r.id), [2]);
+  });
+
   test('DECIMAL strings compare and sort as numbers; the driver rows are returned', async () => {
     const { provider } = stubProvider(singleKey, { rows, fields });
     const matched = await query(provider).where(x => x.price === 12.5).toList();
